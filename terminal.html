@@ -1,0 +1,402 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <title>Termind Terminal</title>
+    <link rel="stylesheet" href="xterm_assets/xterm.css" />
+    <script src="xterm_assets/xterm.js"></script>
+    <script src="xterm_assets/xterm-addon-fit.js"></script>
+    <script src="qrc:///qtwebchannel/qwebchannel.js"></script>
+    <style>
+        body, html {
+            margin: 0; padding: 0; width: 100%; height: 100%;
+            background-color: #1e1e2e; overflow: hidden;
+            -webkit-font-smoothing: antialiased;
+            text-rendering: optimizeLegibility;
+        }
+        #terminal { width: 100%; height: 100%; padding: 10px; box-sizing: border-box; }
+        .error-msg {
+            color: #f38ba8; padding: 20px;
+            font-family: "Cascadia Code", Consolas, monospace;
+            font-size: 13px;
+        }
+        .xterm ::selection,
+        .xterm-screen ::selection,
+        .xterm-rows ::selection {
+            background-color: #89b4fa;
+            color: #1e1e2e;
+        }
+        .xterm-viewport::-webkit-scrollbar { width: 10px; background: transparent; }
+        .xterm-viewport::-webkit-scrollbar-thumb {
+            background: rgba(137, 180, 250, 0.35);
+            border-radius: 6px;
+            border: 2px solid transparent;
+            background-clip: padding-box;
+        }
+        .xterm-viewport::-webkit-scrollbar-thumb:hover {
+            background: rgba(137, 180, 250, 0.6);
+            background-clip: padding-box;
+        }
+        #search-bar {
+            display: none;
+            position: fixed;
+            top: 14px; right: 30px; z-index: 1000;
+            background: rgba(49, 50, 68, 0.96);
+            border: 1px solid #45475a;
+            border-radius: 12px;
+            padding: 8px;
+            box-shadow: 0 10px 32px rgba(0, 0, 0, 0.55);
+            align-items: center; gap: 6px;
+            font-family: "Segoe UI", "Microsoft YaHei", sans-serif;
+            backdrop-filter: blur(10px);
+        }
+        #search-bar.active { display: flex; }
+        #search-input {
+            background: #1e1e2e;
+            border: 1px solid #45475a;
+            color: #cdd6f4;
+            padding: 7px 12px;
+            border-radius: 8px;
+            outline: none;
+            width: 240px;
+            font-size: 13px;
+        }
+        #search-input:focus { border-color: #89b4fa; }
+        #search-input.not-found { border-color: #f38ba8; }
+        #search-bar button {
+            background: transparent;
+            border: 1px solid transparent;
+            color: #a6adc8;
+            padding: 6px 10px;
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 12px;
+            min-width: 32px;
+        }
+        #search-bar button:hover { background: #45475a; color: #cdd6f4; }
+        #search-bar button:active { background: #585b70; }
+    </style>
+</head>
+<body>
+    <div id="terminal"></div>
+    <div id="search-bar">
+        <input id="search-input" type="text" placeholder="查找..." aria-label="搜索终端内容" autocomplete="off">
+        <button id="search-prev" title="上一个 (Shift+Enter)">▲</button>
+        <button id="search-next" title="下一个 (Enter)">▼</button>
+        <button id="search-close" title="关闭 (Esc)">✕</button>
+    </div>
+    <script>
+        let term = null;
+        let fitAddon = null;
+        window.termQueue = [];
+        window.termReady = false;
+
+        let _queueBytes = 0;
+        const _TERM_QUEUE_LIMIT_BYTES = 4 * 1024 * 1024;
+
+        const _initialFontSize = 14;
+        const _initialScrollback = 5000;
+        const _termBg = '#1e1e2e';
+        const _termFg = '#cdd6f4';
+        const _termFont = 'Cascadia Code, Consolas, "Courier New", monospace';
+
+        let _writeQueue = [];
+        let _writeQueueSize = 0;
+        let _writeScheduled = false;
+        const _WRITE_QUEUE_LIMIT = 512 * 1024;
+
+        function _flushWrite() {
+            _writeScheduled = false;
+            if (window.termReady && term && _writeQueue.length) {
+                term.write(_writeQueue.join(''));
+                _writeQueue = [];
+                _writeQueueSize = 0;
+            }
+        }
+
+        window.writeToTerminal = function(data) {
+            if (!window.termReady || !term) {
+                if (_queueBytes >= _TERM_QUEUE_LIMIT_BYTES) return;
+                window.termQueue.push(data);
+                _queueBytes += data.length;
+                return;
+            }
+            _writeQueue.push(data);
+            _writeQueueSize += data.length;
+            if (_writeQueueSize >= _WRITE_QUEUE_LIMIT) {
+                _flushWrite();
+                return;
+            }
+            if (!_writeScheduled) {
+                _writeScheduled = true;
+                requestAnimationFrame(_flushWrite);
+            }
+        };
+
+        window.clearTerminal = function() { if (term) term.clear(); };
+
+        window.setFontSize = function(size) {
+            if (term) { term.options.fontSize = size; window.fitTerminal(); }
+        };
+
+        window.fitTerminal = function() {
+            if (fitAddon && term) {
+                try {
+                    fitAddon.fit();
+                    if (window.bridge) window.bridge.resize_terminal(term.cols, term.rows);
+                } catch (e) { }
+            }
+        };
+
+        let _resizeTimer = null;
+        window.debouncedFit = function() {
+            if (_resizeTimer) clearTimeout(_resizeTimer);
+            _resizeTimer = setTimeout(window.fitTerminal, 60);
+        };
+
+        // ---------------- 搜索 ----------------
+        let _searchState = { lastY: -1 };
+        let _notFoundTimer = null;
+
+        function _flashNotFound() {
+            const input = document.getElementById('search-input');
+            input.classList.add('not-found');
+            if (_notFoundTimer) clearTimeout(_notFoundTimer);
+            _notFoundTimer = setTimeout(function() {
+                input.classList.remove('not-found');
+            }, 400);
+        }
+
+        function _openSearchBar() {
+            const bar = document.getElementById('search-bar');
+            bar.classList.add('active');
+            const input = document.getElementById('search-input');
+            input.focus();
+            input.select();
+        }
+        function _closeSearchBar() {
+            document.getElementById('search-bar').classList.remove('active');
+            if (term) term.focus();
+        }
+        function _doSearch(direction) {
+            if (!term || !term.buffer) return;
+            const input = document.getElementById('search-input');
+            const q = input.value;
+            if (!q) return;
+            const buf = term.buffer.active;
+            const total = buf.length;
+            if (total === 0) return;
+            const needle = q.toLowerCase();
+
+            let startY;
+            if (_searchState.lastY < 0) {
+                startY = direction > 0
+                    ? buf.viewportY
+                    : (buf.viewportY + term.rows - 1);
+            } else {
+                startY = _searchState.lastY + direction;
+            }
+            startY = ((startY % total) + total) % total;
+
+            for (let i = 0; i < total; i++) {
+                const y = ((startY + direction * i) % total + total) % total;
+                const line = buf.getLine(y);
+                if (!line) continue;
+                let raw = '';
+                try { raw = line.translateToString(false); } catch (e) { continue; }
+                const col = raw.toLowerCase().indexOf(needle);
+                if (col >= 0) {
+                    _searchState.lastY = y;
+                    try {
+                        term.scrollToLine(Math.max(0, y - Math.floor(term.rows / 2)));
+                    } catch (e) {}
+                    try { term.select(col, y, q.length); } catch (e) {}
+                    return;
+                }
+            }
+            _searchState.lastY = -1;
+            _flashNotFound();
+        }
+        window.openSearch = _openSearchBar;
+        window.closeSearch = _closeSearchBar;
+        window.searchNext = function() { _doSearch(1); };
+        window.searchPrev = function() { _doSearch(-1); };
+
+        function _initSearchBar() {
+            const input = document.getElementById('search-input');
+            input.addEventListener('keydown', function(e) {
+                if (e.key === 'Enter') {
+                    e.preventDefault();
+                    if (e.shiftKey) window.searchPrev(); else window.searchNext();
+                } else if (e.key === 'Escape') {
+                    e.preventDefault();
+                    window.closeSearch();
+                }
+            });
+            input.addEventListener('input', function() {
+                _searchState.lastY = -1;
+            });
+            document.getElementById('search-next').addEventListener('click', function() {
+                window.searchNext();
+            });
+            document.getElementById('search-prev').addEventListener('click', function() {
+                window.searchPrev();
+            });
+            document.getElementById('search-close').addEventListener('click', function() {
+                window.closeSearch();
+            });
+        }
+
+        // ---------------- ★ 新增：URL 链接识别 ----------------
+        function _installLinkProvider(t) {
+            if (!t || typeof t.registerLinkProvider !== 'function') return;
+            t.registerLinkProvider({
+                provideLinks: function(lineNumber, callback) {
+                    try {
+                        var line = t.buffer.active.getLine(lineNumber - 1);
+                        if (!line) { callback(undefined); return; }
+                        var text = line.translateToString(true);
+                        if (!text) { callback(undefined); return; }
+                        var re = /(?:https?:\/\/|ftp:\/\/)[!-~]+/g;
+                        var links = [];
+                        var m;
+                        while ((m = re.exec(text)) !== null) {
+                            var url = m[0].replace(/[.,;:!?)\]]+$/, '');
+                            if (url.length <= 8) continue;
+                            var start = m.index;
+                            links.push({
+                                range: {
+                                    start: { x: start + 1, y: lineNumber },
+                                    end:   { x: start + url.length, y: lineNumber }
+                                },
+                                text: url,
+                                activate: (function(u) {
+                                    return function() {
+                                        if (window.bridge) window.bridge.open_url(u);
+                                    };
+                                })(url),
+                                hover: function() {
+                                    document.getElementById('terminal').style.cursor = 'pointer';
+                                },
+                                leave: function() {
+                                    document.getElementById('terminal').style.cursor = 'text';
+                                }
+                            });
+                        }
+                        callback(links.length ? links : undefined);
+                    } catch (e) {
+                        callback(undefined);
+                    }
+                }
+            });
+        }
+
+        // ---------------- 初始化 ----------------
+        function initTerm() {
+            if (typeof Terminal === 'undefined') {
+                document.getElementById('terminal').innerHTML =
+                    "<div class='error-msg'>xterm.js 加载失败，请检查 xterm_assets 文件夹。</div>";
+                return;
+            }
+            try {
+                term = new Terminal({
+                    cursorBlink: true,
+                    fontFamily: _termFont,
+                    fontSize: _initialFontSize,
+                    fontWeight: 400,
+                    fontWeightBold: 600,
+                    letterSpacing: 0,
+                    lineHeight: 1.15,
+                    scrollback: _initialScrollback,
+                    minimumContrastRatio: 4.5,
+                    theme: {
+                        background: _termBg,
+                        foreground: _termFg,
+                        cursor: '#f5e0dc',
+                        cursorAccent: '#1e1e2e',
+                        selectionBackground: '#89b4fa',
+                        selectionForeground: '#1e1e2e',
+                        selectionInactiveBackground: '#585b70',
+                    },
+                });
+                fitAddon = new FitAddon.FitAddon();
+                term.loadAddon(fitAddon);
+                term.open(document.getElementById('terminal'));
+
+                window.term = term;
+                window.termReady = true;
+                if (window.termQueue.length) {
+                    window.termQueue.forEach(d => term.write(d));
+                    window.termQueue = [];
+                }
+                _queueBytes = 0;
+                window.fitTerminal();
+                term.focus();
+
+                _initSearchBar();
+                _installLinkProvider(term);   // ★ 新增
+
+                term.attachCustomKeyEventHandler((arg) => {
+                    if (arg.ctrlKey && arg.shiftKey) {
+                        if (arg.code === 'KeyC') {
+                            const sel = term.getSelection();
+                            if (sel && window.bridge) window.bridge.copy_to_clipboard(sel);
+                            return false;
+                        }
+                        if (arg.code === 'KeyV') {
+                            if (window.bridge) window.bridge.get_clipboard_content();
+                            return false;
+                        }
+                    }
+                    if (arg.ctrlKey && !arg.shiftKey && !arg.altKey) {
+                        if (arg.code === 'KeyF') {
+                            window.openSearch();
+                            return false;
+                        }
+                        if (arg.code === 'KeyG') {
+                            window.searchNext();
+                            return false;
+                        }
+                    }
+                    return true;
+                });
+
+                document.getElementById('terminal').addEventListener('wheel', function(e) {
+                    if (e.ctrlKey) {
+                        e.preventDefault();
+                        let size = term.options.fontSize;
+                        if (e.deltaY < 0 && size < 30) size += 1;
+                        else if (e.deltaY > 0 && size > 8) size -= 1;
+                        term.options.fontSize = size;
+                        if (window.bridge) window.bridge.save_font_size(size);
+                        window.fitTerminal();
+                    }
+                }, { passive: false });
+
+                document.getElementById('terminal').addEventListener('contextmenu', function(e) {
+                    e.preventDefault();
+                    if (window.bridge) window.bridge.show_context_menu(term.getSelection());
+                });
+
+                term.onData(e => { if (window.bridge) window.bridge.send_input(e); });
+            } catch (e) {
+                console.error('终端初始化失败:', e);
+                document.getElementById('terminal').innerHTML =
+                    "<div class='error-msg'>终端初始化失败: " + e + "</div>";
+            }
+        }
+
+        try {
+            new QWebChannel(qt.webChannelTransport, function(channel) {
+                window.bridge = channel.objects.bridge;
+                initTerm();
+            });
+        } catch (e) {
+            document.getElementById('terminal').innerHTML =
+                "<div class='error-msg'>WebChannel 初始化失败: " + e + "</div>";
+        }
+
+        window.addEventListener('resize', window.debouncedFit);
+    </script>
+</body>
+</html>

@@ -1,0 +1,6 @@
+PyQt6>=6.5.0
+PyQt6-WebEngine>=6.5.0
+paramiko>=3.0.0
+keyring>=23.0.0
+Pygments>=2.15.0
+pywinpty>=2.0.0; sys_platform == "win32"
